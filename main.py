@@ -262,17 +262,63 @@ def full_data_summary(key: str) -> tuple[int, str, pd.DataFrame]:
 # ------------------------------------------------------------------
 # 資料準備 / 模型
 # ------------------------------------------------------------------
+TARGET_HINTS = ("price", "target", "y", "label", "saleprice", "medv", "profit", "output", "score", "value")
+MAX_LEVELS = 30  # 類別欄位超過這麼多種類別, 預設不當特徵 (One-Hot 會爆量)
+MAX_ONEHOT = 300  # One-Hot 後的欄位上限
+
+
+def parse_date_columns(df: pd.DataFrame) -> list[str]:
+    """把看起來像日期的文字欄位 (≥ 90% 符合 YYYY-MM-DD 開頭) 轉成日期格式, 回傳被轉換的欄位"""
+    out = []
+    for c in df.columns:
+        if pd.api.types.is_numeric_dtype(df[c]) or pd.api.types.is_datetime64_any_dtype(df[c]):
+            continue
+        v = df[c].dropna().astype(str)
+        if len(v) and v.str.match(r"^\d{4}[-/]\d{1,2}[-/]\d{1,2}").mean() >= 0.9:
+            df[c] = pd.to_datetime(df[c], errors="coerce")
+            out.append(c)
+    return out
+
+
+def numeric_ratio(s: pd.Series) -> float:
+    """欄位可轉成數值的比例 (缺失值不計)"""
+    v = s.dropna()
+    return float(pd.to_numeric(v, errors="coerce").notna().mean()) if len(v) else 0.0
+
+
+def feature_exclusions(df: pd.DataFrame, cols: list[str], target: str) -> dict:
+    """自訂資料: 預設不當特徵的欄位與原因 (識別碼、類別太多、缺失太多)"""
+    n, out = len(df), {}
+    for c in cols:
+        if c == target:
+            continue
+        s = df[c]
+        nu = s.nunique(dropna=True)
+        is_num = pd.api.types.is_numeric_dtype(s)
+        if s.isna().mean() > 0.5:
+            out[c] = f"缺失 {s.isna().mean():.0%}"
+        elif (not is_num and nu > 0.5 * n) or (str(c).lower() in ("id", "index") or str(c).lower().endswith("_id")) and nu > 0.9 * n:
+            out[c] = "識別碼 (每列幾乎都不同)"
+        elif not is_num and nu > MAX_LEVELS:
+            out[c] = f"類別太多 ({nu} 種)"
+    return out
+
+
 def prepare_xy(df: pd.DataFrame, target: str, feats: list[str], drop_first: bool = True, baselines=None):
     """缺失值處理 + 類別變數 One-Hot (drop_first=False: 每個類別一欄 100/010/001; True: 移除一個基準類別以避免共線) -> 回傳 X(DataFrame), y(Series), 類別欄位, 清理後 df"""
     d = df[feats + [target]].copy()
     d[target] = pd.to_numeric(d[target], errors="coerce")
     d = d.dropna(subset=[target])
+    if d.empty:
+        raise ValueError(f"目標變數「{target}」沒有可用的數值, 請在側邊欄改選數值型的目標變數")
     cat_cols = [c for c in feats if not pd.api.types.is_numeric_dtype(d[c])]
     for c in feats:
         if c not in cat_cols:
-            d[c] = d[c].fillna(d[c].median())
+            med = d[c].median()
+            d[c] = d[c].fillna(0.0 if pd.isna(med) else med)  # 整欄缺失時以 0 補
         else:
-            d[c] = d[c].fillna(d[c].mode().iloc[0])
+            mode = d[c].mode()
+            d[c] = d[c].fillna(mode.iloc[0] if len(mode) else "(缺失)")
     X = pd.get_dummies(d[feats], columns=cat_cols, drop_first=False, dtype=float)
     if drop_first:  # 每個類別變數移除一個基準類別 (預設第一個, 可由 baselines 指定)
         drop = []
@@ -677,7 +723,8 @@ def _candidates(p: int, k: int, search_k: bool, num_idx):
         C.append((f"RFE (k={x})", "Wrapper 包裝法", "rfe", x, None))
     C.append((FS_NAME_OF["rfecv"], "Wrapper 包裝法", "rfecv", kk, None))
     C.append((f"前向選擇 SFS (k={kk})", "Wrapper 包裝法", "sfs", kk, None))
-    C.append((f"後向選擇 SFS (k={kk})", "Wrapper 包裝法", "sfs_bwd", kk, None))
+    if p <= 25:  # 後向 SFS 要從 p 個逐一刪到 k 個 (每一步都做交叉驗證), 特徵很多時太慢
+        C.append((f"後向選擇 SFS (k={kk})", "Wrapper 包裝法", "sfs_bwd", kk, None))
     C.append((FS_NAME_OF["backward"], "Wrapper 包裝法", "backward", kk, None))
     for m in ("lasso", "enet", "rf"):
         C.append((FS_NAME_OF[m], "Embedded 嵌入法", m, kk, None))
@@ -753,6 +800,28 @@ def pick_best(df: pd.DataFrame):
     return best, ok.sort_values(["特徵數", "cv_rmse"]).iloc[0]
 
 
+ORDERABLE = ("kbest", "kbest_mi", "rfe")  # 選 k 個 = 依分數排序取前 k 個, 可一次算好排序
+
+
+def feature_order(method: str, X: pd.DataFrame, y: np.ndarray) -> list:
+    """把可排序的篩選方法轉成特徵排序 (由重要到不重要), 取前 k 個即等同該方法選 k 個的結果"""
+    cols = list(X.columns)
+    if method.startswith("order:"):
+        names = [c for c in method[6:].split("|") if c in cols]
+        return names + [c for c in cols if c not in names]
+    Xv = X.values.astype(float)
+    Xs = StandardScaler().fit_transform(Xv)
+    if method.startswith("rank:"):
+        return [cols[i] for i in _rank_order(method[5:], X, y, Xs, _cv_n(len(y)))]
+    if method == "kbest":
+        score = np.nan_to_num(f_regression(Xv, y)[0])
+    elif method == "kbest_mi":
+        score = mutual_info_regression(Xv, y, random_state=0)
+    else:  # rfe: 一次刪一個特徵, 刪除順序即排序
+        score = -RFE(LinearRegression(), n_features_to_select=1).fit(Xs, y).ranking_.astype(float)
+    return [cols[i] for i in np.argsort(-score, kind="stable")]
+
+
 @st.cache_data(show_spinner="計算不同特徵數量的表現...")
 def sweep_feature_count(Xtr: pd.DataFrame, ytr: np.ndarray, Xte: pd.DataFrame, yte: np.ndarray,
                         method: str, seed: int, c_thr: float, p_thr: float) -> pd.DataFrame:
@@ -760,6 +829,19 @@ def sweep_feature_count(Xtr: pd.DataFrame, ytr: np.ndarray, Xte: pd.DataFrame, y
     p = Xtr.shape[1]
     kf = KFold(5, shuffle=True, random_state=int(seed))
     rows = []
+    if method.startswith(("rank:", "order:")) or method in ORDERABLE:
+        # 快速路徑: 訓練集與每一折各只算一次排序, 再對 k = 1..p 直接取前 k 個 (結果與逐一重算相同)
+        order = feature_order(method, Xtr, ytr)
+        folds = [(a, b, feature_order(method, Xtr.iloc[a], ytr[a])) for a, b in kf.split(Xtr)]
+        for kk in range(1, p + 1):
+            sel = order[:kk]
+            yh = LinearRegression().fit(Xtr[sel].values, ytr).predict(Xte[sel].values)
+            cv_rmse = [_rmse(ytr[b], LinearRegression().fit(Xtr.iloc[a][o[:kk]].values, ytr[a])
+                             .predict(Xtr.iloc[b][o[:kk]].values)) for a, b, o in folds]
+            rows.append({"特徵數": kk, "保留特徵": "[" + ", ".join(sel) + "]", "RMSE": _rmse(yte, yh),
+                         "R²": float(r2_score(yte, yh)), "CV RMSE (訓練集)": float(np.mean(cv_rmse)),
+                         "CV 標準差": float(np.std(cv_rmse))})
+        return pd.DataFrame(rows)
     cv_method = method
     if method.startswith("order:"):  # 折內篩選時欄位名稱會變成編號, 固定順序也要改用欄位編號
         pos = {c: i for i, c in enumerate(Xtr.columns)}
@@ -816,20 +898,34 @@ model_name = st.sidebar.selectbox("選擇迴歸模型", list(MODELS.keys()))
 model_kind = MODELS[model_name]
 MODEL_SHORT = model_name.split(" (")[0]
 
-with st.sidebar.expander("📂 資料來源 (自訂 URL / 上傳 CSV)", expanded=False):
+with st.sidebar.expander("📂 資料來源 (自訂 URL / 上傳 CSV)", expanded="custom_active" in st.session_state):
     custom_url = st.text_input(
-        "自訂 Dataset URL (可任意輸入, 留空則使用上方內建資料)",
+        "自訂 Dataset URL (留空則使用上方內建資料)",
         value="",
         placeholder="https://raw.githubusercontent.com/.../xxx.csv",
     )
     header_none = st.checkbox("資料沒有標題列 (header=None)", value=False)
     uploaded = st.file_uploader("或上傳 CSV 檔", type=["csv", "txt"])
+    # 上傳 / 輸入網址後不會立刻分析, 按下「執行分析」才切換到自訂資料 (分析較久, 避免每次操作都重算)
+    custom_sig = ((uploaded.name, uploaded.size) if uploaded is not None else custom_url.strip() or None, header_none)
+    has_custom = custom_sig[0] is not None
+    b_run, b_reset = st.columns(2)
+    if b_run.button("▶️ 執行分析", type="primary", disabled=not has_custom, use_container_width=True):
+        st.session_state["custom_active"] = custom_sig
+    if b_reset.button("↩ 內建資料", disabled="custom_active" not in st.session_state, use_container_width=True) or not has_custom:
+        st.session_state.pop("custom_active", None)
+    use_custom = st.session_state.get("custom_active") == custom_sig
+    if has_custom and not use_custom:
+        st.info("已選好資料, 請按「▶️ 執行分析」開始分析 (目前畫面仍是內建資料)。")
+    elif use_custom:
+        st.success("目前分析的是自訂資料; 按「↩ 內建資料」可切回。")
+    st.caption("資料超過「內建資料取樣筆數」時會隨機抽樣; 特徵很多時第一次分析需要數十秒。")
 
 st.sidebar.header("⚙️ 資料切分")
 seed = st.sidebar.number_input("隨機數種子 (Seed)", 0, 99999, 0)
 test_size = st.sidebar.slider("測試集比例", 0.1, 0.5, 0.2, 0.05)
 n_outliers = st.sidebar.slider("標記離群值個數", 1, 20, 10)
-n_sample = st.sidebar.select_slider("內建資料取樣筆數 (0 = 使用全部清理後資料)", [0, 1000, 2000, 3000, 5000, 10000], 3000,
+n_sample = st.sidebar.select_slider("資料取樣筆數 (0 = 使用全部資料)", [0, 1000, 2000, 3000, 5000, 10000], 3000,
                                     help="train.csv 約 111 萬筆; 特徵篩選與巢狀交叉驗證計算量大, 預設隨機抽 3,000 筆以維持互動速度 "
                                          "(說明見「2. 數據理解 → 📌 抽樣說明」)。")
 
@@ -844,13 +940,13 @@ with st.sidebar.expander("📉 梯度下降設定", expanded=False):
 # ------------------------------------------------------------------
 clean_notes = []
 try:
-    if uploaded is not None:
+    if use_custom and uploaded is not None:
         raw = pd.read_csv(uploaded, sep=None, engine="python",
                           header=None if header_none else "infer")
         if header_none:
             raw.columns = [f"x{i}" for i in range(raw.shape[1] - 1)] + ["y"]
         source, is_custom = f"上傳檔案 {uploaded.name}", True
-    elif custom_url.strip():
+    elif use_custom and custom_url.strip():
         raw = read_csv_url(custom_url.strip(), header_none)
         source, is_custom = custom_url.strip(), True
     else:
@@ -860,8 +956,15 @@ except Exception as e:
     st.error(f"❌ 無法讀取資料: {e}")
     st.stop()
 
-raw.columns = [str(c).strip() for c in raw.columns]
+raw.columns = [str(c).strip().lstrip("\ufeff") for c in raw.columns]
 n_full, full_name, full_desc = full_data_summary(problem["key"]) if not is_custom else (len(raw), "", None)
+if is_custom:
+    parsed_dates = parse_date_columns(raw)
+    if parsed_dates:
+        clean_notes.append(f"日期欄 {', '.join(parsed_dates)} 自動轉成日期格式, 只供檢視, 不作為目標或特徵")
+    if 0 < int(n_sample) < len(raw):  # 自訂資料也套用側邊欄的取樣筆數, 避免特徵篩選太慢
+        clean_notes.append(f"上傳資料共 {len(raw):,} 筆, 隨機抽樣 {int(n_sample):,} 筆分析 (random_state=0, 可在側邊欄調整)")
+        raw = raw.sample(int(n_sample), random_state=0).reset_index(drop=True)
 date_cols = [c for c in raw.columns if pd.api.types.is_datetime64_any_dtype(raw[c])]  # 日期欄只供檢視
 cols = [c for c in raw.columns if c not in date_cols]  # 可作為目標 / 特徵的欄位
 if len(cols) < 2:
@@ -869,19 +972,31 @@ if len(cols) < 2:
     st.stop()
 
 st.sidebar.header("🎯 變數選擇")
-default_target = cols[-1] if is_custom else next((c for c in cols if c.lower() == problem["target"].lower()), cols[-1])
-target = st.sidebar.selectbox("目標變數 (y)", cols, index=cols.index(default_target))
+target_opts = [c for c in cols if numeric_ratio(raw[c]) >= 0.5]  # 線性回歸的目標必須是數值
+if not target_opts:
+    st.error("資料中沒有數值型欄位可作為目標變數 (y)。")
+    st.stop()
+if is_custom:
+    default_target = next((c for c in target_opts if c.lower() in TARGET_HINTS), target_opts[-1])
+else:
+    default_target = next((c for c in target_opts if c.lower() == problem["target"].lower()), target_opts[-1])
+target = st.sidebar.selectbox("目標變數 (y)", target_opts, index=target_opts.index(default_target),
+                              help="只列出數值型欄位 (線性回歸的目標必須是連續數值)")
 ar_p = 1
 board_simple = board_ar = None
 auto_ar_note = ""
 if model_kind == "multiple":
-    excluded = [] if is_custom else [c for c in problem.get("exclude", []) if c in cols and c != target]
+    auto_excl = feature_exclusions(raw, cols, target) if is_custom else {}
+    excluded = list(auto_excl) if is_custom else [c for c in problem.get("exclude", []) if c in cols and c != target]
     default_feats = [c for c in cols if c != target and c not in excluded]
     with st.sidebar.expander("特徵變數 (X)" + (f" - 預設排除 {', '.join(excluded)}" if excluded else " - 預設全選"),
                              expanded=False):
         feats = st.multiselect("特徵變數 (X)", [c for c in cols if c != target],
                                default=default_feats, label_visibility="collapsed")
-        if excluded:
+        if auto_excl:
+            st.caption("預設排除 (可自行加回, 但類別太多的欄位 One-Hot 後會大幅增加欄位數): "
+                       + "; ".join(f"{c} — {why}" for c, why in auto_excl.items()))
+        elif excluded:
             st.caption("衍生特徵 (RiskSum 等) 由 20 個因子計算而來, 與原始因子一起放入會完全共線; "
                        "問題 1 只用原始因子, 問題 2 則把 24 個都當候選, 示範用特徵選擇解決共線性。")
 elif model_kind == "simple":
@@ -959,6 +1074,10 @@ try:
         cat_cols, clean = [], pd.DataFrame({target: series_all})
     else:
         X_df, y_s, cat_cols, clean = prepare_xy(raw, target, feats, onehot_drop, onehot_base)
+        if X_df.shape[1] > MAX_ONEHOT:
+            many = sorted(((c, clean[c].nunique()) for c in cat_cols), key=lambda t: -t[1])[:5]
+            raise ValueError(f"One-Hot 編碼後有 {X_df.shape[1]} 個特徵 (上限 {MAX_ONEHOT}), 請在側邊欄「特徵變數」移除類別太多的欄位: "
+                             + ", ".join(f"{c} ({k} 類)" for c, k in many))
 except Exception as e:
     st.error(f"❌ 資料準備失敗: {e}")
     st.stop()
@@ -1052,7 +1171,7 @@ T_LABEL = "時間索引 t"  # AR 圖表的橫軸名稱
 # 標題與 CRISP-DM 各階段 (一頁式)
 # ------------------------------------------------------------------
 with head_box:
-    chips = [("資料", "自訂資料集" if is_custom else "Kaggle Playground S4E5 · Flood Prediction"), ("目標變數", target),
+    chips = [("資料", (uploaded.name if uploaded is not None else "自訂 URL") if is_custom else "Kaggle Playground S4E5 · Flood Prediction"), ("目標變數", target),
              ("模型", MODEL_SHORT), ("樣本", f"{len(raw):,} 筆 (隨機抽樣自 {n_full:,} 筆)" if len(raw) < n_full else f"{len(X_all):,} 筆"), ("使用特徵", f"{len(names)} 個")]
     st.markdown(
         '<div class="hero"><div class="kicker">CRISP-DM · Linear Regression Lab</div>'
