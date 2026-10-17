@@ -7,6 +7,7 @@
 | 資料集 | Kaggle Playground Series S4E5 — *Regression with a Flood Prediction Dataset* |
 | 資料連結 | <https://www.kaggle.com/competitions/playground-series-s4e5/data> |
 | 程式碼 | <https://github.com/marukomaru777/crisp-dm-linear-regression> |
+| 線上網頁 | <https://marukomaru777.github.io/crisp-dm-linear-regression/> (GitHub Pages，瀏覽器版，免安裝) |
 | 特徵數 | 20 個風險因子 (符合 10 ~ 20 個特徵的要求) ＋ 4 個特徵工程衍生特徵 |
 | 目標變數 | `FloodProbability` (洪水發生機率，連續值 0.285 ~ 0.725) |
 | 模型 | 多元線性回歸 (主要)、單純線性回歸、自迴歸 AR(p)；以 sklearn、OLS 公式解、梯度下降法三種方式求解並比較 |
@@ -64,7 +65,11 @@ pip install -r requirements.txt
 streamlit run main.py
 ```
 
-**瀏覽器版** (stlite，在瀏覽器內以 Pyodide 執行 Python)：
+**線上版** (GitHub Pages，直接開啟即可)：<https://marukomaru777.github.io/crisp-dm-linear-regression/>
+
+> 第一次開啟需下載 Pyodide 與 scikit-learn，約 1 分鐘；線上版使用 2 萬筆抽樣檔 `flood_train_sample.csv`，不含 Kaggle 提交檔產生功能。
+
+**瀏覽器版本機執行** (stlite，在瀏覽器內以 Pyodide 執行 Python)：
 
 ```bash
 python3 -m http.server 8766
