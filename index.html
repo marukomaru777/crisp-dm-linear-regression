@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>CRISP-DM 多元線性回歸 - Flood Prediction</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@stlite/browser@1.9.2/build/stlite.css" />
+</head>
+<body>
+  <div id="root"></div>
+  <script type="module">
+    import { mount } from "https://cdn.jsdelivr.net/npm/@stlite/browser@1.9.2/build/stlite.js";
+    mount(
+      {
+        requirements: ["scikit-learn", "scipy", "plotly"],
+        entrypoint: "main.py",
+        streamlitConfig: {
+          "theme.base": "light",
+          "theme.primaryColor": "#2a78d6",
+          "theme.backgroundColor": "#f5f7fb",
+          "theme.secondaryBackgroundColor": "#eef1f7",
+          "theme.textColor": "#1f2430",
+        },
+        files: {
+          "main.py": { url: "./main.py?v=11" },
+          "data/flood_train_sample.csv": { url: "./data/flood_train_sample.csv?v=10" },
+        },
+      },
+      document.getElementById("root")
+    );
+  </script>
+</body>
+</html>

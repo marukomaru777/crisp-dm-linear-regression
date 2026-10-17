@@ -1,0 +1,8 @@
+# Python 虛擬環境與快取
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# 系統檔
+.DS_Store
